@@ -1,0 +1,138 @@
+/**
+ * Office Script: Mapeo interno + VLOOKUP cruzado con "Fichero Oracle sin limpiar"
+ *
+ * Parámetros recibidos desde Power Automate:
+ *   - oracleFileContent: contenido base64 del fichero Oracle (pasado por PA)
+ *
+ * Lógica:
+ *   1. Ejecuta todos los mapeos internos existentes (X..AM)
+ *   2. Para cada fila, si AM != "no", busca AM en la columna C del fichero Oracle
+ *      y trae las columnas D, E, F → escribe en AN, AO, AP del fichero tratado
+ *
+ * NOTA: Los Office Scripts NO pueden abrir otro workbook directamente.
+ * Por eso Power Automate lee el fichero Oracle, extrae los datos relevantes
+ * y los pasa al script como un parámetro JSON (oracleData).
+ * Ver instrucciones Power Automate más abajo.
+ */
+
+function main(
+    workbook: ExcelScript.Workbook,
+    oracleData: string  // JSON: array de {key: string, d: string, e: string, f: string}
+) {
+    const ws = workbook.getWorksheet("tratado");
+    if (!ws) throw new Error("No existe la hoja 'tratado'.");
+
+    // ── 1. Construir mapa de búsqueda desde oracleData ───────────────────────
+    // oracleData es un JSON string con el array de filas del fichero Oracle
+    // Formato: [{ "key": "valor_col_C", "d": "val_D", "e": "val_E", "f": "val_F" }, ...]
+    let lookupMap: { [key: string]: { d: string; e: string; f: string } } = {};
+
+    if (oracleData && oracleData.trim() !== "") {
+        const parsed: { key: string; d: string; e: string; f: string }[] =
+            JSON.parse(oracleData);
+        for (const row of parsed) {
+            if (row.key !== null && row.key !== undefined) {
+                lookupMap[String(row.key).trim()] = {
+                    d: String(row.d ?? ""),
+                    e: String(row.e ?? ""),
+                    f: String(row.f ?? ""),
+                };
+            }
+        }
+    }
+
+    // ── 2. Determinar rango de filas ─────────────────────────────────────────
+    const startRow = 2;
+    const anchorUsed = ws.getRange("G:G").getUsedRange();
+    if (!anchorUsed) return;
+    const lastRow = anchorUsed.getRowIndex() + anchorUsed.getRowCount();
+    if (lastRow < startRow) return;
+
+    const CHUNK_SIZE = 3000;
+
+    const setAndAutoFill = (
+        col: string,
+        r1: number,
+        r2: number,
+        formulaA1: string
+    ) => {
+        const top = ws.getRange(`${col}${r1}`);
+        top.setFormula(formulaA1);
+        const dest = ws.getRange(`${col}${r1}:${col}${r2}`);
+        top.autoFill(dest, ExcelScript.AutoFillType.fillDefault);
+    };
+
+    // ── 3. Determinar primera fila no-BU26 (donde empiezan los mapeos) ─────────
+    const colBValues = ws.getRange(`B${startRow}:B${lastRow}`).getValues();
+    let mappingStartRow = startRow;
+    for (let i = 0; i < colBValues.length; i++) {
+        if (String(colBValues[i][0] ?? "").trim() !== "BU26") {
+            mappingStartRow = startRow + i;
+            break;
+        }
+    }
+
+    // ── 4. Mapeos internos (solo desde mappingStartRow hacia abajo) ───────────
+    for (let r1 = mappingStartRow; r1 <= lastRow; r1 += CHUNK_SIZE) {
+        const r2 = Math.min(lastRow, r1 + CHUNK_SIZE - 1);
+
+        setAndAutoFill("X", r1, r2, `=VLOOKUP(M${r1},mapping_project!$C:$D,2,FALSE)`);
+        setAndAutoFill("Y", r1, r2, `=VLOOKUP(NUMBERVALUE($J${r1}),mapping_CC!$D:$H,2,FALSE)`);
+        setAndAutoFill("Z", r1, r2, `=VLOOKUP(NUMBERVALUE($J${r1}),mapping_CC!$D:$H,5,FALSE)`);
+        setAndAutoFill("AA", r1, r2,
+            `=IF(LEFT(K${r1},1)="4","NonOperatingCost",IFNA(VLOOKUP(AK${r1},mapping_account!$D:$I,5,FALSE),"NonOperatingCost")&" "&IFNA(VLOOKUP(AK${r1},mapping_account!$D:$I,6,FALSE)," "))`);
+        setAndAutoFill("AB", r1, r2,
+            `=IF(LEFT(K${r1},1)="4","NonOperatingCost",IFNA(VLOOKUP(NUMBERVALUE($I${r1}),mapping_account!$B:$M,12,FALSE),"NonOperatingCost"))`);
+        setAndAutoFill("AD", r1, r2,
+            `=IF(ISNUMBER(VLOOKUP(NUMBERVALUE(I${r1}),mapping_account!$B$4:$B$48,1,FALSE)),VLOOKUP(NUMBERVALUE(I${r1}),mapping_account!$B:$G,6,FALSE),"Costes_Directos")`);
+        setAndAutoFill("AE", r1, r2, `=VLOOKUP(NUMBERVALUE($J${r1}),mapping_CC!$D:$H,3,FALSE)`);
+        setAndAutoFill("AF", r1, r2, `=IF(AL${r1}="factura","fact","provi/rever")`);
+        setAndAutoFill("AG", r1, r2,
+            `=IF(ISTEXT(VLOOKUP(CONCATENATE(X${r1},Z${r1}),costes_propios!$C:$C,1,FALSE)),"propios","comunes")`);
+        setAndAutoFill("AH", r1, r2,
+            `=VLOOKUP(AK${r1},mapping_account!$D:$G,3,FALSE)&" "&VLOOKUP(AK${r1},mapping_account!$D:$G,4,FALSE)`);
+        setAndAutoFill("AI", r1, r2, `=MID(N${r1},35,4)`);
+        setAndAutoFill("AJ", r1, r2,
+            `=IFNA(VLOOKUP(NUMBERVALUE($I${r1}),mapping_account!$B:$M,4,FALSE),"NonOperatingCost")`);
+        setAndAutoFill("AK", r1, r2,
+            `=IFNA(XLOOKUP(NUMBERVALUE($I${r1}),mapping_account!$B:$B,mapping_account!$D:$D,"ver",0,1),"NonOperatingCost")`);
+        setAndAutoFill("AL", r1, r2,
+            `=IF(OR(LEFT(G${r1},7)="Invoice",LEFT(G${r1},6)="Period",IFERROR(FIND("Reparto",F${r1}),0)>0,IFERROR(FIND("Bonificacion",F${r1}),0)>0),"factura",IF(LEFT(F${r1},4)="Prov","provisión","reversión"))`);
+        setAndAutoFill("AM", r1, r2, `=IF(LEFT(G${r1},7)="Invoice",MID(G${r1},26,11),"no")`);
+    }
+
+    // ── 5. VLOOKUP cruzado: AM → Oracle B → traer C, D, E a AN, AO, AP ───────
+    // Leemos AM de golpe (más eficiente que celda a celda)
+    const amRange = ws.getRange(`AM${mappingStartRow}:AM${lastRow}`);
+    const amValues = amRange.getValues();
+
+    const anValues: (string | number)[][] = [];
+    const aoValues: (string | number)[][] = [];
+    const apValues: (string | number)[][] = [];
+
+    for (let i = 0; i < amValues.length; i++) {
+        const amVal = String(amValues[i][0] ?? "").trim();
+
+        if (amVal === "" || amVal === "no") {
+            anValues.push(["no aplica"]);
+            aoValues.push(["no aplica"]);
+            apValues.push(["no aplica"]);
+        } else {
+            const match = lookupMap[amVal];
+            if (match) {
+                anValues.push([match.d]);
+                aoValues.push([match.e]);
+                apValues.push([match.f]);
+            } else {
+                anValues.push(["no encontrado"]);
+                aoValues.push(["no encontrado"]);
+                apValues.push(["no encontrado"]);
+            }
+        }
+    }
+
+    // Escribir resultados de una sola vez (mucho más rápido que celda a celda)
+    ws.getRange(`AN${mappingStartRow}:AN${lastRow}`).setValues(anValues);
+    ws.getRange(`AO${mappingStartRow}:AO${lastRow}`).setValues(aoValues);
+    ws.getRange(`AP${mappingStartRow}:AP${lastRow}`).setValues(apValues);
+}
