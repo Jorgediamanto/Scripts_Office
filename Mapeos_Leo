@@ -1,0 +1,344 @@
+/**
+ * Office Script: Mapeos internos y externos — VERSIÓN OPTIMIZADA v3 (INCREMENTAL)
+ *
+ * CAMBIO FUNCIONAL CRÍTICO vs v2:
+ *   Solo mapea las filas NUEVAS (las que aún tienen X vacía).
+ *   Las filas ya mapeadas en ejecuciones anteriores NO se tocan.
+ *
+ *   Esto es obligatorio funcionalmente: cada mes se carga un Report Voucher
+ *   distinto, y si recalculáramos filas viejas con el Voucher nuevo, los
+ *   datos de meses anteriores se corromperían (facturas viejas pasarían de
+ *   "encontrado" a "no encontrado").
+ *
+ * Lógica:
+ *   1. Detecta el rango de filas nuevas buscando la primera fila (desde abajo)
+ *      cuya X esté vacía.
+ *   2. Mapea solo ese rango.
+ *
+ * Parámetro desde Power Automate:
+ *   - oracleData: string JSON con array [{ key, d, e, f }, ...] del Report Voucher
+ */
+
+function main(
+    workbook: ExcelScript.Workbook,
+    oracleData: string
+): void {
+    const WRITE_CHUNK = 5000;
+
+    const ws = workbook.getWorksheet("tratado");
+    if (!ws) throw new Error("No existe la hoja 'tratado'.");
+
+    // ── 0. Construir lookupMap desde oracleData ───────────────────────────────
+    const lookupMap: { [key: string]: { d: string; e: string; f: string } } = {};
+    if (oracleData && oracleData.trim() !== "") {
+        const parsed = JSON.parse(oracleData) as
+            { key: string; d: string; e: string; f: string }[];
+        for (const row of parsed) {
+            if (row.key !== null && row.key !== undefined) {
+                lookupMap[String(row.key).trim()] = {
+                    d: String(row.d ?? ""),
+                    e: String(row.e ?? ""),
+                    f: String(row.f ?? ""),
+                };
+            }
+        }
+    }
+
+    // ── 1. Determinar última fila con datos en 'tratado' ──────────────────────
+    const used = ws.getUsedRange(true);
+    if (!used) { console.log("Hoja 'tratado' vacía."); return; }
+    const lastRow = used.getRowIndex() + used.getRowCount();
+    const startRow = 2;
+    if (lastRow < startRow) return;
+
+    // ── 2. Detectar primera fila SIN MAPEAR (X vacía) ─────────────────────────
+    // Leemos toda la columna X y buscamos la primera fila vacía desde arriba,
+    // saltándonos la zona BU26 (que nunca se mapea).
+    console.log(`Leyendo columna X${startRow}:X${lastRow} para detectar filas nuevas…`);
+    const xValues = ws.getRange(`X${startRow}:X${lastRow}`).getValues();
+    const bValues = ws.getRange(`B${startRow}:B${lastRow}`).getValues();
+
+    // Saltar filas BU26 (presupuesto, nunca se mapea)
+    let searchStartIdx = 0;
+    for (let i = 0; i < bValues.length; i++) {
+        if (String(bValues[i][0] ?? "").trim() !== "BU26") {
+            searchStartIdx = i;
+            break;
+        }
+    }
+
+    // Desde searchStartIdx, buscar la primera fila cuya X esté vacía.
+    // Asumimos que a partir de esa fila, todas las siguientes también están sin mapear
+    // (las filas nuevas se appendean siempre al final).
+    let firstUnmappedIdx = -1;
+    for (let i = searchStartIdx; i < xValues.length; i++) {
+        const x = xValues[i][0];
+        if (x === null || x === undefined || String(x).trim() === "") {
+            firstUnmappedIdx = i;
+            break;
+        }
+    }
+
+    if (firstUnmappedIdx === -1) {
+        console.log("No hay filas nuevas por mapear. Todas las filas ya tienen valor en X.");
+        return;
+    }
+
+    const mappingStartRow = startRow + firstUnmappedIdx;
+    const rowsToMap = lastRow - mappingStartRow + 1;
+    console.log(`Primera fila sin mapear: ${mappingStartRow}. Filas a mapear: ${rowsToMap}.`);
+
+    if (rowsToMap <= 0) {
+        console.log("Nada que mapear.");
+        return;
+    }
+
+    // ── 3. Cargar mapping_project a diccionario: C → D ────────────────────────
+    const mpSheet = workbook.getWorksheet("mapping_project");
+    if (!mpSheet) throw new Error("Falta hoja mapping_project.");
+    const mpUsed = mpSheet.getUsedRange(true);
+    const mappingProject: { [k: string]: string } = {};
+    if (mpUsed) {
+        const mpVals = mpUsed.getValues();
+        for (let i = 0; i < mpVals.length; i++) {
+            const k = mpVals[i][2];
+            const v = mpVals[i][3];
+            if (k !== null && k !== undefined && String(k).trim() !== "") {
+                mappingProject[String(k).trim()] = String(v ?? "");
+            }
+        }
+    }
+
+    // ── 4. Cargar mapping_CC a diccionario: D → {E, F, H} ─────────────────────
+    const ccSheet = workbook.getWorksheet("mapping_CC");
+    if (!ccSheet) throw new Error("Falta hoja mapping_CC.");
+    const ccUsed = ccSheet.getUsedRange(true);
+    const mappingCC: { [k: string]: { e: string; f: string; h: string } } = {};
+    if (ccUsed) {
+        const ccVals = ccUsed.getValues();
+        for (let i = 0; i < ccVals.length; i++) {
+            const k = ccVals[i][3];
+            if (k !== null && k !== undefined && String(k).trim() !== "") {
+                const keyNum = Number(k);
+                const key = isNaN(keyNum) ? String(k).trim() : String(keyNum);
+                mappingCC[key] = {
+                    e: String(ccVals[i][4] ?? ""),
+                    f: String(ccVals[i][5] ?? ""),
+                    h: String(ccVals[i][7] ?? ""),
+                };
+            }
+        }
+    }
+
+    // ── 5. Cargar mapping_account → lookups por D y por B ─────────────────────
+    const maSheet = workbook.getWorksheet("mapping_account");
+    if (!maSheet) throw new Error("Falta hoja mapping_account.");
+    const maUsed = maSheet.getUsedRange(true);
+    const maByD: { [k: string]: { f: string; g: string; h: string; i: string } } = {};
+    const maByB: { [k: string]: { d: string; e: string; g: string; m: string } } = {};
+    const maB4B48Set: { [k: string]: true } = {};
+    if (maUsed) {
+        const maVals = maUsed.getValues();
+        const startIdx = maUsed.getRowIndex();
+        for (let i = 0; i < maVals.length; i++) {
+            const absRow = startIdx + i + 1;
+            const bVal = maVals[i][1];
+            const dVal = maVals[i][3];
+            if (bVal !== null && bVal !== undefined && String(bVal).trim() !== "") {
+                const bNum = Number(bVal);
+                const bKey = isNaN(bNum) ? String(bVal).trim() : String(bNum);
+                maByB[bKey] = {
+                    d: String(maVals[i][3] ?? ""),
+                    e: String(maVals[i][4] ?? ""),
+                    g: String(maVals[i][6] ?? ""),
+                    m: String(maVals[i][12] ?? ""),
+                };
+                if (absRow >= 4 && absRow <= 48) maB4B48Set[bKey] = true;
+            }
+            if (dVal !== null && dVal !== undefined && String(dVal).trim() !== "") {
+                const dKey = String(dVal).trim();
+                maByD[dKey] = {
+                    f: String(maVals[i][5] ?? ""),
+                    g: String(maVals[i][6] ?? ""),
+                    h: String(maVals[i][7] ?? ""),
+                    i: String(maVals[i][8] ?? ""),
+                };
+            }
+        }
+    }
+
+    // ── 6. Cargar costes_propios → set de concatenados (col C) ────────────────
+    const cpSheet = workbook.getWorksheet("costes_propios");
+    const costesPropiosSet: { [k: string]: true } = {};
+    if (cpSheet) {
+        const cpUsed = cpSheet.getUsedRange(true);
+        if (cpUsed) {
+            const cpVals = cpUsed.getValues();
+            for (let i = 0; i < cpVals.length; i++) {
+                const k = cpVals[i][2];
+                if (k !== null && k !== undefined && String(k).trim() !== "") {
+                    costesPropiosSet[String(k).trim()] = true;
+                }
+            }
+        }
+    }
+
+    // ── 7. Leer SOLO las filas a mapear (columnas B..N) ───────────────────────
+    console.log(`Leyendo rango B${mappingStartRow}:N${lastRow} (${rowsToMap} filas)…`);
+    const srcValues = ws.getRange(`B${mappingStartRow}:N${lastRow}`).getValues();
+
+    // ── 8. Calcular las columnas X–AP en memoria ──────────────────────────────
+    const NUM_OUT_COLS = 19;
+    const outRows: (string | number)[][] = [];
+
+    for (let i = 0; i < srcValues.length; i++) {
+        const row = srcValues[i];
+        const F = String(row[4] ?? "");
+        const G = String(row[5] ?? "");
+        const I_raw = row[7];
+        const J_raw = row[8];
+        const K = String(row[9] ?? "");
+        const M = String(row[11] ?? "");
+        const N = String(row[12] ?? "");
+
+        const I_num = (I_raw === null || I_raw === undefined || I_raw === "") ? NaN : Number(I_raw);
+        const J_num = (J_raw === null || J_raw === undefined || J_raw === "") ? NaN : Number(J_raw);
+        const I_key = isNaN(I_num) ? "" : String(I_num);
+        const J_key = isNaN(J_num) ? "" : String(J_num);
+
+        const akMatch = maByB[I_key];
+        const AK = akMatch ? akMatch.d : "NonOperatingCost";
+
+        const X = (mappingProject[M.trim()] !== undefined) ? mappingProject[M.trim()] : "#N/A";
+
+        const ccMatch = J_key !== "" ? mappingCC[J_key] : undefined;
+        const Y = ccMatch ? ccMatch.e : "#N/A";
+        const Z = ccMatch ? ccMatch.h : "#N/A";
+        const AE = ccMatch ? ccMatch.f : "#N/A";
+
+        let AA: string;
+        if (K.length > 0 && K.charAt(0) === "4") {
+            AA = "NonOperatingCost";
+        } else {
+            const mD = maByD[AK];
+            const p1 = mD ? mD.h : "NonOperatingCost";
+            const p2 = mD ? mD.i : " ";
+            AA = p1 + " " + p2;
+        }
+
+        let AB: string;
+        if (K.length > 0 && K.charAt(0) === "4") {
+            AB = "NonOperatingCost";
+        } else {
+            const mB = maByB[I_key];
+            AB = mB ? mB.m : "NonOperatingCost";
+        }
+
+        let AD: string;
+        if (I_key !== "" && maB4B48Set[I_key]) {
+            const mB = maByB[I_key];
+            AD = mB ? mB.g : "Costes_Directos";
+        } else {
+            AD = "Costes_Directos";
+        }
+
+        let AL: string;
+        if (
+            G.substring(0, 7) === "Invoice" ||
+            G.substring(0, 6) === "Period" ||
+            F.indexOf("Reparto") >= 0 ||
+            F.indexOf("Bonificacion") >= 0
+        ) {
+            AL = "factura";
+        } else if (F.substring(0, 4) === "Prov") {
+            AL = "provisión";
+        } else {
+            AL = "reversión";
+        }
+        const AF = (AL === "factura") ? "fact" : "provi/rever";
+
+        const concatXZ = String(X) + String(Z);
+        const AG = costesPropiosSet[concatXZ] ? "propios" : "comunes";
+
+        const mD_AH = maByD[AK];
+        const AH = (mD_AH ? mD_AH.f : "") + " " + (mD_AH ? mD_AH.g : "");
+
+        const AI = N.length >= 34 ? N.substring(34, 38) : "";
+
+        const mB_AJ = maByB[I_key];
+        const AJ = mB_AJ ? mB_AJ.e : "NonOperatingCost";
+
+        const AM = (G.substring(0, 7) === "Invoice" && G.length >= 25)
+            ? G.substring(25, 36)
+            : "no";
+
+        let AN: string, AO: string, AP: string;
+        const amTrim = AM.trim();
+        if (amTrim === "" || amTrim === "no") {
+            AN = "no aplica"; AO = "no aplica"; AP = "no aplica";
+        } else {
+            const match = lookupMap[amTrim];
+            if (match) { AN = match.d; AO = match.e; AP = match.f; }
+            else { AN = "no encontrado"; AO = "no encontrado"; AP = "no encontrado"; }
+        }
+
+        const out: (string | number)[] = new Array(NUM_OUT_COLS);
+        out[0] = X;
+        out[1] = Y;
+        out[2] = Z;
+        out[3] = AA;
+        out[4] = AB;
+        out[5] = "";
+        out[6] = AD;
+        out[7] = AE;
+        out[8] = AF;
+        out[9] = AG;
+        out[10] = AH;
+        out[11] = AI;
+        out[12] = AJ;
+        out[13] = AK;
+        out[14] = AL;
+        out[15] = AM;
+        out[16] = AN;
+        out[17] = AO;
+        out[18] = AP;
+        outRows.push(out);
+    }
+
+    console.log(`Calculadas ${outRows.length} filas. Escribiendo en chunks de ${WRITE_CHUNK}…`);
+
+    // ── 9. ESCRITURA con cálculo en MANUAL ────────────────────────────────────
+    const app = workbook.getApplication();
+    const prevMode = app.getCalculationMode();
+    app.setCalculationMode(ExcelScript.CalculationMode.manual);
+    console.log(`Cálculo puesto en manual (antes: ${prevMode}).`);
+
+    try {
+        let currentRow = mappingStartRow;
+        for (let start = 0; start < outRows.length; start += WRITE_CHUNK) {
+            const chunk = outRows.slice(start, Math.min(start + WRITE_CHUNK, outRows.length));
+            const endRow = currentRow + chunk.length - 1;
+            const rangeRef = `X${currentRow}:AP${endRow}`;
+
+            for (let i = 0; i < chunk.length; i++) {
+                for (let j = 0; j < NUM_OUT_COLS; j++) {
+                    const v = chunk[i][j];
+                    if (v === undefined || v === null) {
+                        chunk[i][j] = "";
+                    } else if (typeof v === "number" && !isFinite(v)) {
+                        chunk[i][j] = "";
+                    }
+                }
+            }
+
+            ws.getRange(rangeRef).setValues(chunk);
+            console.log(`Chunk escrito: ${rangeRef} (${chunk.length} filas)`);
+            currentRow += chunk.length;
+        }
+    } finally {
+        app.setCalculationMode(ExcelScript.CalculationMode.automatic);
+        console.log("Cálculo reactivado a automatic.");
+    }
+
+    console.log("Mapeos completados.");
+}
