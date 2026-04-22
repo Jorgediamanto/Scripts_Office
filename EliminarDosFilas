@@ -1,0 +1,4 @@
+function main(workbook: ExcelScript.Workbook) {
+  const sheet = workbook.getActiveWorksheet();
+  sheet.getRange("1:2").delete(ExcelScript.DeleteShiftDirection.up);
+}
