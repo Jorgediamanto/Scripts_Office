@@ -1,4 +1,29 @@
 function main(workbook: ExcelScript.Workbook) {
-  const sheet = workbook.getActiveWorksheet();
-  sheet.getRange("1:2").delete(ExcelScript.DeleteShiftDirection.up);
+    // Detecta dinámicamente cuántas filas hay que borrar por encima de la cabecera real.
+    // ANTIGUO: título en fila 1, fila 2 vacía, cabeceras en fila 3 -> borra 2 filas
+    // NUEVO  : título en fila 1, cabeceras en fila 2              -> borra 1 fila
+    const sheet = workbook.getActiveWorksheet();
+    const SEARCH_ROWS = 10;
+    const HEADER_TOKEN = "Ledger Name";
+
+    const probe = sheet.getRangeByIndexes(0, 0, SEARCH_ROWS, 1).getValues();
+
+    let headerRowIndex = -1; // 0-based
+    for (let i = 0; i < probe.length; i++) {
+        const v = (probe[i][0] ?? "").toString().trim();
+        if (v === HEADER_TOKEN) { headerRowIndex = i; break; }
+    }
+
+    if (headerRowIndex === -1) {
+        throw new Error(`No se encontró la cabecera "${HEADER_TOKEN}" en las primeras ${SEARCH_ROWS} filas de la columna A.`);
+    }
+    if (headerRowIndex === 0) {
+        console.log("La cabecera ya está en la fila 1. No se borra nada.");
+        return;
+    }
+
+    const rowsToDelete = headerRowIndex;
+    const rangeRef = `1:${rowsToDelete}`;
+    console.log(`Cabecera en fila ${headerRowIndex + 1}. Borrando filas ${rangeRef}.`);
+    sheet.getRange(rangeRef).delete(ExcelScript.DeleteShiftDirection.up);
 }
