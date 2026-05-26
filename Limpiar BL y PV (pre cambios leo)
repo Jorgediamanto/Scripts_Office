@@ -1,0 +1,58 @@
+function main(workbook: ExcelScript.Workbook) {
+    const ws = workbook.getWorksheets()[0];
+
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const rowCount = used.getRowCount();
+    const colCount = used.getColumnCount();
+
+    // 1) Leer SOLO cabeceras (fila 1)
+    const headers = ws.getRangeByIndexes(0, 0, 1, colCount).getValues()[0]
+        .map(v => (v ?? "").toString().trim());
+
+    const blCol = headers.indexOf("Business Line");
+    // Acepta tanto inglés como español
+    const pvCol = headers.indexOf("Project Value") !== -1
+        ? headers.indexOf("Project Value")
+        : headers.indexOf("Project Valor");
+
+    if (blCol === -1 || pvCol === -1) {
+        throw new Error(`No encuentro cabeceras. BL=${blCol}, PV=${pvCol}. Headers: ${headers.join("|")}`);
+    }
+
+    // 2) Procesar por bloques para no superar límites
+    const CHUNK = 5000;
+    for (let chunkEnd = rowCount - 1; chunkEnd >= 1; chunkEnd -= CHUNK) {
+        const chunkStart = Math.max(1, chunkEnd - CHUNK + 1);
+        const chunkRows = chunkEnd - chunkStart + 1;
+
+        const blVals = ws.getRangeByIndexes(chunkStart, blCol, chunkRows, 1).getValues();
+        const pvVals = ws.getRangeByIndexes(chunkStart, pvCol, chunkRows, 1).getValues();
+
+        const del: boolean[] = new Array(chunkRows).fill(false);
+        for (let i = 0; i < chunkRows; i++) {
+            const bl = (blVals[i][0] ?? "").toString().trim();
+            const pv = (pvVals[i][0] ?? "").toString().trim().toUpperCase();
+            if (bl === "59000" || pv === "GA2767") del[i] = true;
+        }
+
+        // 3) Borrar en bloques contiguos, desde abajo
+        let i = chunkRows - 1;
+        while (i >= 0) {
+            if (!del[i]) { i--; continue; }
+
+            let endLocal = i;
+            let startLocal = i;
+            while (startLocal - 1 >= 0 && del[startLocal - 1]) startLocal--;
+
+            const deleteStartRow = chunkStart + startLocal;
+            const deleteCount = endLocal - startLocal + 1;
+
+            ws.getRangeByIndexes(deleteStartRow, 0, deleteCount, colCount)
+                .delete(ExcelScript.DeleteShiftDirection.up);
+
+            i = startLocal - 1;
+        }
+    }
+}
