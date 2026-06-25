@@ -1,0 +1,44 @@
+function main(workbook: ExcelScript.Workbook): string {
+    const SHEET_NAME = "tratado";
+    const TABLE_NAME = "tblTratado";
+
+    const sheet = workbook.getWorksheet(SHEET_NAME);
+    if (!sheet) {
+        throw new Error(`La hoja "${SHEET_NAME}" no existe.`);
+    }
+
+    // 1. Detectar el rango real con datos
+    const usedRange = sheet.getUsedRange();
+    if (!usedRange) {
+        return JSON.stringify({ mensaje: "Hoja vacía, nada que redimensionar." });
+    }
+
+    const firstRow = usedRange.getRowIndex();      // fila de cabecera (0-based)
+    const firstCol = usedRange.getColumnIndex();
+    const totalRows = usedRange.getRowCount();      // incluye cabecera
+    const totalCols = usedRange.getColumnCount();
+
+    // 2. Construir el rango que debe abarcar la tabla
+    const targetRange = sheet.getRangeByIndexes(firstRow, firstCol, totalRows, totalCols);
+
+    // 3. Buscar la tabla; si existe, redimensionar; si no, crearla
+    let table = workbook.getTable(TABLE_NAME);
+
+    if (table) {
+        // La tabla existe: solo reajustar su rango a los datos actuales
+        table.setRange(targetRange);
+    } else {
+        // No existe (p.ej. primera vez o se perdió): crearla
+        table = sheet.addTable(targetRange, true /* tiene cabeceras */);
+        table.setName(TABLE_NAME);
+    }
+
+    const result = {
+        mensaje: `Tabla "${TABLE_NAME}" ajustada.`,
+        filas: totalRows - 1,   // sin contar cabecera
+        columnas: totalCols,
+        rango: targetRange.getAddress()
+    };
+    console.log(JSON.stringify(result));
+    return JSON.stringify(result);
+}
