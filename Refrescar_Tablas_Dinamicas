@@ -1,0 +1,63 @@
+function main(workbook: ExcelScript.Workbook, lote: number, tamanoLote: number): string {
+    // Descubrir dinámicamente todas las hojas que tienen tablas dinámicas
+    const allSheets = workbook.getWorksheets();
+    const sheetsWithPivots: ExcelScript.Worksheet[] = [];
+
+    for (const ws of allSheets) {
+        if (ws.getPivotTables().length > 0) {
+            sheetsWithPivots.push(ws);
+        }
+    }
+
+    const totalSheets = sheetsWithPivots.length;
+    if (totalSheets === 0) {
+        return "No hay hojas con tablas dinámicas.";
+    }
+
+    // Calcular total de lotes
+    const batchSize = tamanoLote > 0 ? tamanoLote : 10;
+    const totalLotes = Math.ceil(totalSheets / batchSize);
+
+    // Validar lote
+    if (lote < 1 || lote > totalLotes) {
+        return JSON.stringify({
+            mensaje: `Lote ${lote} fuera de rango. Total hojas con pivots: ${totalSheets}, total lotes: ${totalLotes}.`,
+            totalHojasConPivots: totalSheets,
+            totalLotes: totalLotes,
+            refrescados: 0,
+            errores: 0
+        });
+    }
+
+    // Seleccionar hojas de este lote
+    const startIdx = (lote - 1) * batchSize;
+    const endIdx = Math.min(startIdx + batchSize, totalSheets);
+    const batchSheets = sheetsWithPivots.slice(startIdx, endIdx);
+
+    let refreshed = 0;
+    let errors = 0;
+
+    for (const ws of batchSheets) {
+        const pivots = ws.getPivotTables();
+        for (const pt of pivots) {
+            try {
+                pt.refresh();
+                refreshed++;
+            } catch (e) {
+                console.log(`Error en "${pt.getName()}" (${ws.getName()}): ${e}`);
+                errors++;
+            }
+        }
+    }
+
+    const result = {
+        mensaje: `Lote ${lote}/${totalLotes}: ${batchSheets.length} hojas procesadas.`,
+        totalHojasConPivots: totalSheets,
+        totalLotes: totalLotes,
+        refrescados: refreshed,
+        errores: errors
+    };
+
+    console.log(JSON.stringify(result));
+    return JSON.stringify(result);
+}
